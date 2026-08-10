@@ -147,7 +147,7 @@ class InstallationManager:
             content=dialog_content,
             actions=[
                 ft.TextButton(
-                    text=self._["install_now"],
+                    content=self._["install_now"],
                     icon=ft.Icons.DOWNLOAD,
                     style=ft.ButtonStyle(
                         color=ft.Colors.WHITE, bgcolor=ft.Colors.BLUE_600, overlay_color=ft.Colors.BLUE_800
@@ -155,7 +155,7 @@ class InstallationManager:
                     on_click=self.on_install_clicked,
                 ),
                 ft.TextButton(
-                    text=self._["later_on"],
+                    content=self._["later_on"],
                     icon=ft.Icons.ACCESS_TIME,
                     style=ft.ButtonStyle(color=ft.Colors.GREY_700),
                     on_click=self.close_dialog,

@@ -1,0 +1,20 @@
+# Optional: AI 切片功能依赖（Mage-VL + faster-whisper 本地离线推理）
+# 仅在需要 AI 切片时安装：pip install -r requirements-ai-clip.txt
+# 部署细节见 docs/ai_clip_deploy.md
+#
+# 注意：transformers>=5.7 是 Mage-VL 的硬依赖且较新，可能与某些环境冲突；
+# bitsandbytes 在原生 Windows 可能装不上（用 WSL2 或社区预编译 wheel）。
+
+# 视觉模型（Mage-VL）
+transformers>=5.7
+accelerate>=1.0
+bitsandbytes>=0.43          # 4-bit 量化（8GB 显存必装）；装不上见 deploy doc
+
+# 语音模型（faster-whisper，CTranslate2 后端，不依赖 torch）
+faster-whisper>=1.0
+
+# 视频解码（Mage-VL 帧采样 / HEVC 后端）
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0
+decord>=0.6

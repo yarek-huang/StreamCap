@@ -29,6 +29,7 @@ StreamCap 是一个基于FFmpeg和StreamGet的多平台直播流录制客户端�
 - **多种输出格式**：支持 ts、flv、mkv、mov、mp4、mp3、m4a 等格式。
 - **自动转码**：录制完成后自动转码为 mp4 格式。
 - **消息推送**：支持直播状态推送，及时获取开播通知。
+- **AI 切片**：录制完成后，本地离线跑 Mage-VL（视觉）+ faster-whisper（语音）识别带货片段，自动切片并逐片通知。详见 [AI 切片部署文档](./docs/ai_clip_deploy.md) 与 [配置文档](./docs/ai_clip_config.md)。
 
 ## 📸录制界面
 

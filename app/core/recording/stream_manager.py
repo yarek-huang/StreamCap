@@ -508,6 +508,12 @@ class LiveStreamRecorder:
                             self.user_config.get("convert_to_mp4"),
                         )
 
+                if self.user_config.get("ai_clip_enabled"):
+                    logger.info("Prepare AI clip pipeline in the background")
+                    self.services.run_coro(
+                        self._run_ai_clip_pipeline(save_file_path)
+                    )
+
         except Exception as e:
             logger.error(f"An error occurred during the subprocess execution: {e}")
             self._handle_recording_error(record_name, self._["no_ffmpeg_tip"], duration=4000)
@@ -603,6 +609,63 @@ class LiveStreamRecorder:
             logger.error(f"Error occurred during conversion: {e}")
         except Exception as e:
             logger.error(f"An unknown error occurred: {e}")
+
+    async def _run_ai_clip_pipeline(self, save_file_path: str) -> None:
+        """Trigger the AI clip pipeline after the recording finishes (wayfinder MAP-001).
+
+        Per ticket 007 §5: must run on a post-transcode mp4 and must not race with
+        ``converts_mp4``. If the source is ts and transcode is enabled, wait for the
+        expected mp4 to appear; otherwise self-remux to a temp mp4.
+        """
+        from ..clipping.clip_pipeline import ClipPipeline, self_remux_to_mp4
+
+        will_transcode = (
+            self.user_config.get("convert_to_mp4") and self.save_format == "ts"
+        )
+
+        # Collect actual source files: single, or all segments (template like xxx_%03d.ts).
+        # Mirrors the segment handling in the converts_mp4 block above.
+        if self.segment_record:
+            base_dir = os.path.dirname(save_file_path)
+            prefix = os.path.basename(save_file_path).rsplit("_", maxsplit=1)[0]
+            seg_paths = sorted(
+                p for p in utils.get_file_paths(base_dir)
+                if prefix in p and os.path.basename(p) != os.path.basename(save_file_path)
+            )
+            if not seg_paths:
+                logger.error(f"[AI-Clip] no segment files matched prefix '{prefix}'; aborting.")
+                return
+        else:
+            seg_paths = [save_file_path]
+
+        for src in seg_paths:
+            source = src
+            if will_transcode:
+                expected_mp4 = src.rsplit(".", maxsplit=1)[0] + ".mp4"
+                source = await self._await_mp4(expected_mp4)
+                if not source:
+                    logger.warning("[AI-Clip] transcoded mp4 not found; falling back to self-remux.")
+                    source = self_remux_to_mp4(src)
+            elif not src.lower().endswith(".mp4"):
+                source = self_remux_to_mp4(src)
+
+            if not source or not os.path.exists(source):
+                logger.error(f"[AI-Clip] no usable mp4 source for {src}; skipping this segment.")
+                continue
+
+            pipeline = ClipPipeline(self.services, self.recording, source)
+            await pipeline.run()
+
+    async def _await_mp4(self, mp4_path: str, timeout: int = 1800) -> str | None:
+        """Poll for a transcoded mp4 to appear (transcode runs as a separate coro)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if os.path.exists(mp4_path) and os.path.getsize(mp4_path) > 0:
+                # give the writer a moment to finalize
+                await asyncio.sleep(1)
+                return mp4_path
+            await asyncio.sleep(2)
+        return None
 
     async def custom_script_execute(
         self,
@@ -770,6 +833,12 @@ class LiveStreamRecorder:
                     logger.error(f"Failed to execute custom script: {e}")
                     await self.custom_script_execute(
                         script_command, record_name, save_file_path, save_type, False, False
+                    )
+
+                if self.user_config.get("ai_clip_enabled"):
+                    logger.info("Prepare AI clip pipeline in the background (direct download)")
+                    self.services.run_coro(
+                        self._run_ai_clip_pipeline(save_file_path)
                     )
 
             return True

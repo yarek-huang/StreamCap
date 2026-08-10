@@ -23,6 +23,7 @@ class RecordingStatus:
     NOT_RECORDING_SPACE = "NOT_RECORDING_SPACE"
     LIVE_STATUS_CHECK_ERROR = "LIVE_STATUS_CHECK_ERROR"
     LIVE_BROADCASTING = "LIVE_BROADCASTING"
+    AI_CLIPPING = "AI_CLIPPING"
 
     @classmethod
     def get_status(cls):
