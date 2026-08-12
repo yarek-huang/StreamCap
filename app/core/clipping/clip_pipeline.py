@@ -70,6 +70,8 @@ class ClipPipeline:
         self._set_status(RecordingStatus.AI_CLIPPING)
         vlm_model_path = cfg.get("ai_clip_mage_vl_model_path", "microsoft/Mage-VL")
         llm_model_path = cfg.get("ai_clip_llm_model_path", "Qwen/Qwen2.5-7B-Instruct")
+        llm_system_prompt = cfg.get("ai_clip_llm_system_prompt", "") or ""
+        llm_user_prompt_tmpl = cfg.get("ai_clip_llm_user_prompt", "") or ""
         asr_path = cfg.get("ai_clip_asr_model_path", "Systran/faster-whisper-large-v3")
         compute_type = cfg.get("ai_clip_asr_compute_type", "int8_float16")
         window_s = int(cfg.get("ai_clip_window_seconds", 360) or 360)
@@ -131,6 +133,8 @@ class ClipPipeline:
                         llm_model_path,
                         use_4bit=use_4bit,
                         max_new_tokens=llm_max_new_tokens,
+                        system_prompt=llm_system_prompt,
+                        user_prompt_tmpl=llm_user_prompt_tmpl,
                     )
                 except Exception as e:
                     logger.error(f"[AI-Clip] LLM path failed: {e}")

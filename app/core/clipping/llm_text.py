@@ -19,7 +19,8 @@ from ...utils.logger import logger
 
 # Whole-transcript commerce-grounding prompt. Emphasises semantic (not literal)
 # detection and timestamp reuse from the provided transcript.
-_SYSTEM_PROMPT = (
+# These are exposed (no leading underscore) so the settings UI can pre-fill them.
+SYSTEM_PROMPT = (
     "你是一个直播带货切片助手。你会收到一段完整的直播字幕（带时间戳），"
     "请通读全文，基于上下文语义找出所有\"正式推销商品\"的时段"
     "（主播介绍商品、报价、讲卖点、催下单、对比优惠等带货行为），"
@@ -29,17 +30,21 @@ _SYSTEM_PROMPT = (
     "同一商品的不同卖点（如介绍、报价、催单）可各成一段。"
 )
 
-_USER_PROMPT_TMPL = (
+USER_PROMPT_TMPL = (
     "以下是直播字幕，每行格式为 [开始时间 -> 结束时间] 文本：\n\n"
     "{transcript}\n\n"
     "请基于整段语义，输出 JSON 数组，每个元素代表一个带货时段：\n"
-    "{{\"product\":商品名(无明确名称时写\"商品\"), "
+    "{\"product\":商品名(无明确名称时写\"商品\"), "
     "\"selling_point\":一句话卖点, "
-    "\"start\":\"开始时间\", \"end\":\"结束时间\"}}\n"
+    "\"start\":\"开始时间\", \"end\":\"结束时间\"}\n"
     "时间必须从上面字幕里已出现过的时间戳中选取（可直接引用某行的开始/结束时间），"
     "不得编造时间。start 必须小于 end。若整段没有带货内容，输出空数组 []。"
     "\n只输出 JSON 数组，不要任何解释文字。"
 )
+
+# Backward-compat aliases used inside this module.
+_SYSTEM_PROMPT = SYSTEM_PROMPT
+_USER_PROMPT_TMPL = USER_PROMPT_TMPL
 
 # Matches HH:MM:SS(.mmm), MM:SS(.xx), or bare seconds. Used to parse LLM output
 # timestamps back into float seconds.
@@ -107,6 +112,8 @@ def analyze_transcript(
     use_4bit: bool = True,
     max_new_tokens: int = 2048,
     max_transcript_chars: int = 60000,
+    system_prompt: str | None = None,
+    user_prompt_tmpl: str | None = None,
 ) -> list[dict]:
     """Run a cached text LLM over the whole transcript; return global-time clips.
 
@@ -114,9 +121,19 @@ def analyze_transcript(
     Returns ``[{product, selling_point, start, end}, ...]`` with ``start``/``end``
     as float seconds. Empty list on failure or when no transcript is available.
     The model is cached across calls; call ``release_llm_models`` when done.
+
+    ``system_prompt`` / ``user_prompt_tmpl`` override the built-in prompts when
+    non-empty (user_prompt_tmpl must contain ``{transcript}`` as the placeholder
+    where the transcript is injected). Empty/None falls back to the built-ins.
     """
     if not segments:
         return []
+
+    sys_p = (system_prompt or "").strip() or _SYSTEM_PROMPT
+    usr_tmpl = (user_prompt_tmpl or "").strip() or _USER_PROMPT_TMPL
+    if "{transcript}" not in usr_tmpl:
+        logger.warning("[AI-Clip] custom user_prompt missing {transcript} placeholder; using built-in.")
+        usr_tmpl = _USER_PROMPT_TMPL
 
     transcript = _format_transcript(segments)
     if len(transcript) > max_transcript_chars:
@@ -137,8 +154,8 @@ def analyze_transcript(
 
     try:
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": _USER_PROMPT_TMPL.format(transcript=transcript)},
+            {"role": "system", "content": sys_p},
+            {"role": "user", "content": usr_tmpl.replace("{transcript}", transcript)},
         ]
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True

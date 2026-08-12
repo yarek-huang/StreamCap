@@ -6,6 +6,8 @@ import flet as ft
 
 from ...core.runtime.paths import default_recordings_dir
 from ...core.runtime.scheduled_shutdown import MAX_QUICK_SHUTDOWN_HOURS
+from ...core.clipping.llm_text import SYSTEM_PROMPT as _LLM_SYS_PROMPT
+from ...core.clipping.llm_text import USER_PROMPT_TMPL as _LLM_USR_PROMPT
 from ...models.media.audio_format_model import AudioFormat
 from ...models.media.video_format_model import VideoFormat
 from ...models.media.video_quality_model import VideoQuality
@@ -710,6 +712,32 @@ class SettingsPage(PageBase):
                                 data="ai_clip_llm_max_new_tokens",
                                 on_change=self.on_change,
                                 hint_text=self._["ai_clip_llm_max_new_tokens_tip"],
+                                ),
+                   ),
+                   self.create_setting_row(
+                            self._["ai_clip_llm_system_prompt"],
+                            ft.TextField(
+                                value=self.get_config_value("ai_clip_llm_system_prompt", _LLM_SYS_PROMPT),
+                                width=500,
+                                multiline=True,
+                                min_lines=2,
+                                max_lines=6,
+                                data="ai_clip_llm_system_prompt",
+                                on_change=self.on_change,
+                                hint_text=self._["ai_clip_llm_system_prompt_tip"],
+                                ),
+                   ),
+                   self.create_setting_row(
+                            self._["ai_clip_llm_user_prompt"],
+                            ft.TextField(
+                                value=self.get_config_value("ai_clip_llm_user_prompt", _LLM_USR_PROMPT),
+                                width=500,
+                                multiline=True,
+                                min_lines=3,
+                                max_lines=8,
+                                data="ai_clip_llm_user_prompt",
+                                on_change=self.on_change,
+                                hint_text=self._["ai_clip_llm_user_prompt_tip"],
                                 ),
                    ),
                    self.create_setting_row(
