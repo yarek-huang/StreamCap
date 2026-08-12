@@ -99,16 +99,22 @@ def analyze_video(
         else:
             load_kwargs["device_map"] = "auto"
         processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        # Configure pixel budget DIRECTLY on the video_processor. The processor's
-        # __call__ only swaps frame-count params (num_frames/max_frames/target_fps),
-        # NOT max_pixels/min_pixels, so passing them as kwargs is a no-op for the
-        # video path. Defaults (max=1605632, min=200704) are far too large for 8GB
-        # VRAM. We also force min < max to avoid smart_resize logic conflict.
-        vp = getattr(processor, "video_processor", None)
-        if vp is not None:
-            vp.max_pixels = max_pixels
-            vp.min_pixels = min(max_pixels // 4, 200704)
-            logger.info(f"[AI-Clip] video pixel budget: max={vp.max_pixels} min={vp.min_pixels}")
+        # Configure pixel budget on EVERY processor sub-object that carries a
+        # max_pixels attribute. The image_processor (Qwen2VLImageProcessor) does
+        # the final smart_resize on pixel values, the video_processor does the
+        # frame-level resize; both default to ~4,000,000 px/frame (from
+        # preprocessor_config.json) which blows up 8GB VRAM. Setting min<max
+        # avoids smart_resize logic conflict.
+        _budget_min = min(max_pixels // 4, 200704)
+        for _attr in ("video_processor", "image_processor"):
+            _obj = getattr(processor, _attr, None)
+            if _obj is not None:
+                try:
+                    _obj.max_pixels = max_pixels
+                    _obj.min_pixels = _budget_min
+                    logger.info(f"[AI-Clip] {_attr} pixel budget: max={max_pixels} min={_budget_min}")
+                except Exception as _e:
+                    logger.warning(f"[AI-Clip] could not set pixel budget on {_attr}: {_e}")
         model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs).eval()
     except Exception as e:
         logger.error(f"[AI-Clip] VLM load failed: {e}")

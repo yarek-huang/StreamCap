@@ -535,6 +535,33 @@ class SettingsPage(PageBase):
                             ),
                         ),
                         self.create_setting_row(
+                            self._["ai_clip_asr_enabled"],
+                            ft.Switch(
+                                value=self.get_config_value("ai_clip_asr_enabled"),
+                                data="ai_clip_asr_enabled",
+                                on_change=self.on_change,
+                                tooltip=self._["ai_clip_asr_enabled_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
+                            self._["ai_clip_llm_enabled"],
+                            ft.Switch(
+                                value=self.get_config_value("ai_clip_llm_enabled"),
+                                data="ai_clip_llm_enabled",
+                                on_change=self.on_change,
+                                tooltip=self._["ai_clip_llm_enabled_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
+                            self._["ai_clip_vlm_enabled"],
+                            ft.Switch(
+                                value=self.get_config_value("ai_clip_vlm_enabled"),
+                                data="ai_clip_vlm_enabled",
+                                on_change=self.on_change,
+                                tooltip=self._["ai_clip_vlm_enabled_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
                             self._["ai_clip_notification_enabled"],
                             ft.Switch(
                                 value=self.get_config_value("ai_clip_notification_enabled"),
@@ -551,6 +578,16 @@ class SettingsPage(PageBase):
                                 data="ai_clip_mage_vl_model_path",
                                 on_change=self.on_change,
                                 hint_text="HuggingFace id 或本地路径，如 microsoft/Mage-VL",
+                            ),
+                        ),
+                        self.create_setting_row(
+                            self._["ai_clip_llm_model_path"],
+                            ft.TextField(
+                                value=self.get_config_value("ai_clip_llm_model_path"),
+                                width=300,
+                                data="ai_clip_llm_model_path",
+                                on_change=self.on_change,
+                                hint_text=self._["ai_clip_llm_model_path_tip"],
                             ),
                         ),
                         self.create_setting_row(
@@ -663,6 +700,16 @@ class SettingsPage(PageBase):
                                 width=100,
                                 data="ai_clip_vlm_max_new_tokens",
                                 on_change=self.on_change,
+                                ),
+                   ),
+                   self.create_setting_row(
+                            self._["ai_clip_llm_max_new_tokens"],
+                            ft.TextField(
+                                value=self.get_config_value("ai_clip_llm_max_new_tokens"),
+                                width=100,
+                                data="ai_clip_llm_max_new_tokens",
+                                on_change=self.on_change,
+                                hint_text=self._["ai_clip_llm_max_new_tokens_tip"],
                                 ),
                    ),
                    self.create_setting_row(

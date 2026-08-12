@@ -15,6 +15,12 @@ faster-whisper>=1.0
 
 # 视频解码（Mage-VL 帧采样 / HEVC 后端）
 opencv-python>=4.8
-numpy>=1.24
+numpy==1.26.4            # 锁死：funasr/torch/torchaudio 均未充分兼容 numpy 2.x，松约束会被 uv 升到 2.x 导致元数据损坏
 Pillow>=10.0
 decord>=0.6
+
+# 语音模型 - SenseVoice 后端（FunAudioLLM，快 5-15 倍，中文强）
+funasr>=1.1
+torchaudio>=2.1
+librosa>=0.10
+soundfile>=0.12

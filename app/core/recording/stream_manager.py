@@ -51,6 +51,9 @@ class LiveStreamRecorder:
         self.direct_downloader = None
         self.min_valid_recording_duration = 25
         self.recording_start_time = 0
+        # Serializes ai-clip runs across segments so two segments never run VLM
+        # concurrently (would double VRAM and OOM on 8GB cards). Instance-scoped.
+        self._ai_clip_lock = asyncio.Lock()
         os.makedirs(self.output_dir, exist_ok=True)
         self.services.language_manager.add_observer(self)
         self._ = {}
@@ -402,6 +405,10 @@ class LiveStreamRecorder:
             logger.log("STREAM", f"Recording Stream URL: {record_url}")
             self.recording_start_time = time.time()
 
+            # Segments already processed during recording (transcode + ai-clip).
+            # Post-loop batch skips these. Stores segment basenames.
+            self._processed_segments: set[str] = set()
+
             while True:
                 if self.should_stop or self.recording.force_stop or not self.services.recording_enabled:
                     logger.info(f"Preparing to End Recording: {live_url}")
@@ -438,6 +445,13 @@ class LiveStreamRecorder:
                     self.recording.is_recording = False
                     break
 
+                # Scheme 3: during segmented recording, detect completed segments
+                # and kick off transcode + ai-clip early (per-tick check).
+                try:
+                    await self._maybe_process_segments(save_file_path)
+                except Exception as _seg_err:
+                    logger.debug(f"[AI-Clip] per-tick segment check error: {_seg_err}")
+
                 await asyncio.sleep(1)
 
             await process.wait()
@@ -469,6 +483,9 @@ class LiveStreamRecorder:
                         prefix = os.path.basename(save_file_path).rsplit("_", maxsplit=1)[0]
                         for path in file_paths:
                             if prefix in path:
+                                # Skip segments already transcode+during recording (scheme 3).
+                                if os.path.basename(path) in getattr(self, "_processed_segments", set()):
+                                    continue
                                 try:
                                     self.services.run_coro(self.converts_mp4(path, self.user_config["delete_original"]))
                                 except Exception as e:
@@ -610,51 +627,127 @@ class LiveStreamRecorder:
         except Exception as e:
             logger.error(f"An unknown error occurred: {e}")
 
-    async def _run_ai_clip_pipeline(self, save_file_path: str) -> None:
-        """Trigger the AI clip pipeline after the recording finishes (wayfinder MAP-001).
+    async def _maybe_process_segments(self, save_file_path: str) -> None:
+        """Called each tick during segmented recording (scheme 3, plan-3).
 
-        Per ticket 007 §5: must run on a post-transcode mp4 and must not race with
-        ``converts_mp4``. If the source is ts and transcode is enabled, wait for the
-        expected mp4 to appear; otherwise self-remux to a temp mp4.
+        Detects newly completed segments and kicks off transcode + ai-clip for them
+        immediately, instead of waiting for the whole recording to end. A segment is
+        considered "complete" once a newer segment file has appeared (ffmpeg's segment
+        muxer writes files sequentially, so file N is finalized when file N+1 exists).
+
+        The currently-open segment (the highest-numbered one) is never processed here;
+        it is left to the post-loop batch. Already-processed basenames are recorded in
+        ``self._processed_segments`` so the post-loop batch skips them.
         """
-        from ..clipping.clip_pipeline import ClipPipeline, self_remux_to_mp4
+        if not (self.segment_record and self.user_config.get("ai_clip_enabled")):
+            return
+        try:
+            base_dir = os.path.dirname(save_file_path)
+            prefix = os.path.basename(save_file_path).rsplit("_", maxsplit=1)[0]
+            segs = sorted(
+                p for p in utils.get_file_paths(base_dir)
+                if prefix in os.path.basename(p)
+                and os.path.isfile(p)
+                and os.path.basename(p).lower().endswith("." + self.save_format)
+            )
+        except Exception:
+            return
+        # Exclude the latest segment (still being written) unless only one exists and
+        # we're about to stop. Safe rule: process all but the last in the list.
+        if len(segs) < 2:
+            return
+        to_process = segs[:-1]
+        for seg in to_process:
+            name = os.path.basename(seg)
+            if name in self._processed_segments:
+                continue
+            self._processed_segments.add(name)
+            logger.info(f"[AI-Clip] segment completed during recording, processing early: {name}")
+            # Transcode first (fire-and-forget, same as post-loop), then ai-clip.
+            if self.user_config.get("convert_to_mp4") and self.save_format == "ts":
+                try:
+                    self.services.run_coro(self.converts_mp4(seg, self.user_config["delete_original"]))
+                except Exception as e:
+                    logger.error(f"[AI-Clip] early transcode failed for {name}: {e}")
+            try:
+                self.services.run_coro(self._run_ai_clip_pipeline_single(seg))
+            except Exception as e:
+                logger.error(f"[AI-Clip] early ai-clip failed for {name}: {e}")
 
-        will_transcode = (
-            self.user_config.get("convert_to_mp4") and self.save_format == "ts"
-        )
+    async def _run_ai_clip_pipeline_single(self, seg_path: str) -> None:
+        """Run the ai-clip pipeline for a single completed segment file.
 
-        # Collect actual source files: single, or all segments (template like xxx_%03d.ts).
-        # Mirrors the segment handling in the converts_mp4 block above.
+        Serialized by ``self._ai_clip_lock`` so two segments never run VLM
+        concurrently (would double VRAM usage and OOM on 8GB cards). The lock is
+        awaited *inside* this coro, not at the call site, so the recording loop's
+        per-tick check never blocks waiting for a prior segment.
+        """
+        async with self._ai_clip_lock:
+            from ..clipping.clip_pipeline import ClipPipeline, self_remux_to_mp4
+
+            source = seg_path
+            will_transcode = (
+                self.user_config.get("convert_to_mp4") and self.save_format == "ts"
+            )
+            if will_transcode:
+                expected_mp4 = seg_path.rsplit(".", maxsplit=1)[0] + ".mp4"
+                source = await self._await_mp4(expected_mp4)
+                if not source:
+                    logger.warning("[AI-Clip] transcoded mp4 not found; falling back to self-remux.")
+                    source = self_remux_to_mp4(seg_path)
+            elif not seg_path.lower().endswith(".mp4"):
+                source = self_remux_to_mp4(seg_path)
+
+            if not source or not os.path.exists(source):
+                logger.error(f"[AI-Clip] no usable mp4 source for {seg_path}; skipping.")
+                return
+
+            pipeline = ClipPipeline(self.services, self.recording, source)
+            await pipeline.run()
+
+    async def _run_ai_clip_pipeline(self, save_file_path: str) -> None:
+        """Trigger the AI clip pipeline after the recording finishes (post-loop batch).
+
+        For segmented recordings, skips segments already processed during recording
+        (``self._processed_segments``). Only the not-yet-processed segments (typically
+        just the last one) are handled here.
+        """
         if self.segment_record:
             base_dir = os.path.dirname(save_file_path)
             prefix = os.path.basename(save_file_path).rsplit("_", maxsplit=1)[0]
             seg_paths = sorted(
                 p for p in utils.get_file_paths(base_dir)
-                if prefix in p and os.path.basename(p) != os.path.basename(save_file_path)
+                if prefix in p
+                and os.path.basename(p) != os.path.basename(save_file_path)
+                and os.path.isfile(p)
+                # Only original-recorded segment files (by save_format extension),
+                # excluding transcoded .mp4 outputs and any .json/.srt sidecars.
+                and os.path.basename(p).lower().endswith("." + self.save_format)
             )
+            # Skip segments already processed during recording.
+            seg_paths = [
+                p for p in seg_paths
+                if os.path.basename(p) not in getattr(self, "_processed_segments", set())
+            ]
             if not seg_paths:
-                logger.error(f"[AI-Clip] no segment files matched prefix '{prefix}'; aborting.")
+                logger.info("[AI-Clip] all segments already processed during recording; nothing to do.")
                 return
+            logger.info(f"[AI-Clip] post-loop batch: {len(seg_paths)} segment(s) left to process.")
         else:
             seg_paths = [save_file_path]
 
         for src in seg_paths:
-            source = src
-            if will_transcode:
-                expected_mp4 = src.rsplit(".", maxsplit=1)[0] + ".mp4"
-                source = await self._await_mp4(expected_mp4)
-                if not source:
-                    logger.warning("[AI-Clip] transcoded mp4 not found; falling back to self-remux.")
-                    source = self_remux_to_mp4(src)
-            elif not src.lower().endswith(".mp4"):
-                source = self_remux_to_mp4(src)
+            await self._run_ai_clip_pipeline_single(src)
 
-            if not source or not os.path.exists(source):
-                logger.error(f"[AI-Clip] no usable mp4 source for {src}; skipping this segment.")
-                continue
-
-            pipeline = ClipPipeline(self.services, self.recording, source)
-            await pipeline.run()
+        # Recording finished: release cached ASR/LLM models so VRAM is freed
+        # back to idle (StreamCap stays resident, so models must not linger).
+        try:
+            from ..clipping import asr as _asr_stage
+            from ..clipping import llm_text as _llm_stage
+            _asr_stage.release_asr_models()
+            _llm_stage.release_llm_models()
+        except Exception as e:
+            logger.debug(f"[AI-Clip] model release after batch: {e}")
 
     async def _await_mp4(self, mp4_path: str, timeout: int = 1800) -> str | None:
         """Poll for a transcoded mp4 to appear (transcode runs as a separate coro)."""
