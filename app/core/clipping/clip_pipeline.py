@@ -74,6 +74,11 @@ class ClipPipeline:
         llm_user_prompt_tmpl = cfg.get("ai_clip_llm_user_prompt", "") or ""
         asr_path = cfg.get("ai_clip_asr_model_path", "Systran/faster-whisper-large-v3")
         compute_type = cfg.get("ai_clip_asr_compute_type", "int8_float16")
+        # Cloud LLM (OpenAI-chat-compatible) vs local transformers path.
+        llm_cloud = llm_text_stage._is_cloud_provider(cfg.get("ai_clip_llm_provider"))
+        llm_api_base = cfg.get("ai_clip_llm_api_base", "")
+        llm_api_key = cfg.get("ai_clip_llm_api_key", "")
+        llm_api_model = cfg.get("ai_clip_llm_api_model", "")
         window_s = int(cfg.get("ai_clip_window_seconds", 360) or 360)
         overlap_s = int(cfg.get("ai_clip_window_overlap_seconds", 20) or 20)
         use_4bit = bool(cfg.get("ai_clip_use_4bit", True))
@@ -113,11 +118,12 @@ class ClipPipeline:
             if segments:
                 await asyncio.to_thread(asr_stage.save_transcript_json, segments, self.source_video)
 
-        # Free ASR VRAM before loading the (cached) LLM. ASR and the 4-bit LLM
+        # Free ASR VRAM before loading the (cached) local LLM. ASR and the 4-bit LLM
         # cannot coexist on an 8GB card: ASR(int8 ~2.5G) + LLM(4bit ~4.5G) +
         # CUDA context/KV-cache/fragmentation exceeds 8G. ASR reloads cheaply
         # (~10s) but the LLM is expensive to load, so we cache the LLM instead.
-        if asr_on and llm_on:
+        # Cloud LLM loads nothing locally, so keep ASR warm for the next segment.
+        if asr_on and llm_on and not llm_cloud:
             await asyncio.to_thread(asr_stage.release_asr_models)
 
         # 2. LLM text-understanding path: reads the whole transcript at once for
@@ -127,15 +133,28 @@ class ClipPipeline:
                 logger.warning("[AI-Clip] LLM path needs ASR segments; skipping (run ASR first).")
             else:
                 try:
-                    llm_clips = await asyncio.to_thread(
-                        llm_text_stage.analyze_transcript,
-                        segments,
-                        llm_model_path,
-                        use_4bit=use_4bit,
-                        max_new_tokens=llm_max_new_tokens,
-                        system_prompt=llm_system_prompt,
-                        user_prompt_tmpl=llm_user_prompt_tmpl,
-                    )
+                    if llm_cloud:
+                        llm_clips = await asyncio.to_thread(
+                            llm_text_stage.analyze_transcript_cloud,
+                            segments,
+                            llm_api_base,
+                            llm_api_key,
+                            llm_api_model,
+                            max_new_tokens=llm_max_new_tokens,
+                            system_prompt=llm_system_prompt,
+                            user_prompt_tmpl=llm_user_prompt_tmpl,
+                            max_retries=max_retries,
+                        )
+                    else:
+                        llm_clips = await asyncio.to_thread(
+                            llm_text_stage.analyze_transcript,
+                            segments,
+                            llm_model_path,
+                            use_4bit=use_4bit,
+                            max_new_tokens=llm_max_new_tokens,
+                            system_prompt=llm_system_prompt,
+                            user_prompt_tmpl=llm_user_prompt_tmpl,
+                        )
                 except Exception as e:
                     logger.error(f"[AI-Clip] LLM path failed: {e}")
                     llm_clips = []

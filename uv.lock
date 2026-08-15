@@ -1037,7 +1037,7 @@ wheels = [
 [[package]]
 name = "streamcap"
 version = "1.0.3"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "aiofiles" },
     { name = "cachetools" },

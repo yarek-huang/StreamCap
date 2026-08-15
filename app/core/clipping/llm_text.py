@@ -13,9 +13,18 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 from typing import Any
 
 from ...utils.logger import logger
+
+# Cloud provider id for the OpenAI-chat-compatible LLM path (ai_clip_llm_provider).
+PROVIDER_OPENAI_CHAT = "openai_chat"
+
+
+def _is_cloud_provider(provider: Any) -> bool:
+    """True when the LLM provider config selects the cloud chat-completions path."""
+    return str(provider or "").strip().lower() == PROVIDER_OPENAI_CHAT
 
 # Whole-transcript commerce-grounding prompt. Emphasises semantic (not literal)
 # detection and timestamp reuse from the provided transcript.
@@ -129,18 +138,7 @@ def analyze_transcript(
     if not segments:
         return []
 
-    sys_p = (system_prompt or "").strip() or _SYSTEM_PROMPT
-    usr_tmpl = (user_prompt_tmpl or "").strip() or _USER_PROMPT_TMPL
-    if "{transcript}" not in usr_tmpl:
-        logger.warning("[AI-Clip] custom user_prompt missing {transcript} placeholder; using built-in.")
-        usr_tmpl = _USER_PROMPT_TMPL
-
-    transcript = _format_transcript(segments)
-    if len(transcript) > max_transcript_chars:
-        logger.warning(
-            f"[AI-Clip] transcript very long ({len(transcript)} chars); truncating to {max_transcript_chars}."
-        )
-        transcript = transcript[:max_transcript_chars]
+    messages = _build_messages(segments, system_prompt, user_prompt_tmpl, max_transcript_chars)
 
     try:
         import torch  # type: ignore
@@ -153,10 +151,6 @@ def analyze_transcript(
         return []
 
     try:
-        messages = [
-            {"role": "system", "content": sys_p},
-            {"role": "user", "content": usr_tmpl.replace("{transcript}", transcript)},
-        ]
         text = tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
@@ -316,3 +310,132 @@ def _extract_json_array(text: str) -> str:
     if start != -1 and end != -1 and end > start:
         return text[start:end + 1]
     return ""
+
+
+# --- Cloud path: OpenAI-chat-compatible chat/completions API ----------------
+#
+# Mirrors analyze_transcript() but sends the same system/user prompts to a
+# remote endpoint (SiliconFlow, DeepSeek, OpenAI, local vLLM/ollama, ...) via
+# plain httpx — no openai SDK dependency. Reuses _format_transcript and the
+# defensive _parse_clips so local and cloud paths stay behaviour-identical.
+
+_API_TIMEOUT_SECONDS = 120.0
+_RETRY_BACKOFF_SECONDS = 1.0
+
+
+def _chat_url(api_base: str) -> str:
+    """``{api_base}`` -> ``{api_base}/chat/completions`` (single slash, no dupes)."""
+    return str(api_base or "").strip().rstrip("/") + "/chat/completions"
+
+
+def _build_messages(
+    segments: list[dict],
+    system_prompt: str | None,
+    user_prompt_tmpl: str | None,
+    max_transcript_chars: int,
+) -> list[dict]:
+    """Shared prompt construction for local & cloud paths -> chat messages."""
+    sys_p = (system_prompt or "").strip() or _SYSTEM_PROMPT
+    usr_tmpl = (user_prompt_tmpl or "").strip() or _USER_PROMPT_TMPL
+    if "{transcript}" not in usr_tmpl:
+        logger.warning("[AI-Clip] custom user_prompt missing {transcript} placeholder; using built-in.")
+        usr_tmpl = _USER_PROMPT_TMPL
+    transcript = _format_transcript(segments)
+    if len(transcript) > max_transcript_chars:
+        logger.warning(
+            f"[AI-Clip] transcript very long ({len(transcript)} chars); truncating to {max_transcript_chars}."
+        )
+        transcript = transcript[:max_transcript_chars]
+    return [
+        {"role": "system", "content": sys_p},
+        {"role": "user", "content": usr_tmpl.replace("{transcript}", transcript)},
+    ]
+
+
+def analyze_transcript_cloud(
+    segments: list[dict],
+    api_base: str,
+    api_key: str,
+    api_model: str,
+    *,
+    max_new_tokens: int = 2048,
+    max_transcript_chars: int = 60000,
+    system_prompt: str | None = None,
+    user_prompt_tmpl: str | None = None,
+    max_retries: int = 3,
+) -> list[dict]:
+    """Cloud twin of ``analyze_transcript``: POST the transcript to an
+    OpenAI-chat-compatible endpoint and parse the reply into float-second clips.
+
+    ``api_base`` is everything before ``/chat/completions`` (e.g.
+    ``https://api.siliconflow.cn/v1``). Returns ``[]`` on failure; never raises.
+    """
+    if not segments:
+        return []
+    api_base = str(api_base or "").strip()
+    api_model = str(api_model or "").strip()
+    api_key = str(api_key or "").strip()
+    if not (api_base and api_model):
+        logger.error("[AI-Clip] cloud LLM disabled: api_base/api_model not configured.")
+        return []
+    if not api_key:
+        logger.error("[AI-Clip] cloud LLM disabled: api_key is empty.")
+        return []
+
+    import httpx  # main dependency (requirements.txt), no extra install
+
+    messages = _build_messages(segments, system_prompt, user_prompt_tmpl, max_transcript_chars)
+    payload = {
+        "model": api_model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": max_new_tokens,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"}
+    url = _chat_url(api_base)
+
+    # Reasoning models (deepseek-r1/reasoner, glm-z1, qwen-thinking, ...) burn
+    # max_tokens on hidden chain-of-thought before writing the visible answer;
+    # with a small cap the content comes back empty/truncated with
+    # finish_reason=length. On that signal, double the cap and resend.
+    _MAX_TOKEN_DOUBLINGS = 3
+
+    last_err: Exception | None = None
+    total_attempts = max(1, max_retries)
+    doublings = 0
+    for attempt in range(1, total_attempts + 1):
+        try:
+            resp = httpx.post(url, json=payload, headers=headers, timeout=_API_TIMEOUT_SECONDS)
+            resp.raise_for_status()
+            data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            message = choice.get("message", {}) or {}
+            finish_reason = str(choice.get("finish_reason") or "")
+            raw = str(message.get("content", "") or "")
+            reasoning = str(message.get("reasoning_content", "") or "")
+            if finish_reason == "length" and attempt < total_attempts and doublings < _MAX_TOKEN_DOUBLINGS:
+                new_cap = min(payload["max_tokens"] * 2, 32768)
+                if new_cap > payload["max_tokens"]:
+                    logger.warning(
+                        f"[AI-Clip] cloud LLM hit max_tokens={payload['max_tokens']} "
+                        f"(finish_reason=length"
+                        + (f", reasoning burned {len(reasoning)} chars" if reasoning else "")
+                        + f"); retrying with max_tokens={new_cap}"
+                    )
+                    payload["max_tokens"] = new_cap
+                    doublings += 1
+                    continue
+            logger.debug(f"[AI-Clip] cloud LLM raw output:\n{raw}")
+            clips = _parse_clips(raw)
+            if not clips:
+                logger.warning(f"[AI-Clip] cloud LLM output parsed to 0 clips. Raw output was:\n{raw[:1500]}")
+            logger.success(f"[AI-Clip] cloud LLM text understanding done: {len(clips)} clip(s)")
+            return clips
+        except Exception as e:
+            last_err = e
+            # Never log the Authorization header / key.
+            logger.warning(f"[AI-Clip] cloud LLM request attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
+    logger.error(f"[AI-Clip] cloud LLM failed after {max_retries} attempt(s): {last_err}")
+    return []

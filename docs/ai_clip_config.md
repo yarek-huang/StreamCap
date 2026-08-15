@@ -11,6 +11,10 @@
 | `ai_clip_enabled` | bool | `false` | **总开关**。开 = 录完后自动跑 AI 切片流水线。 |
 | `ai_clip_notification_enabled` | bool | `false` | 切片结果通知开关（独立于直播开播/结束通知）。开 + 至少一个推送渠道开才发。 |
 | `ai_clip_mage_vl_model_path` | str | `microsoft/Mage-VL` | VLM 模型。HuggingFace id 或本地绝对路径。 |
+| `ai_clip_llm_provider` | str | `local` | LLM 推理方式。`local`=本地 transformers 加载 `ai_clip_llm_model_path`；`openai_chat`=请求 OpenAI 兼容云端接口（见下「LLM 云端模式」）。 |
+| `ai_clip_llm_api_base` | str | `https://api.siliconflow.cn/v1` | 云端模式：API 地址，填到 `/v1`。 |
+| `ai_clip_llm_api_key` | str | 空 | 云端模式：API Key。 |
+| `ai_clip_llm_api_model` | str | `Qwen/Qwen2.5-72B-Instruct` | 云端模式：服务商模型 id。 |
 | `ai_clip_asr_model_path` | str | `Systran/faster-whisper-large-v3` | ASR 模型。HuggingFace id 或本地绝对路径。 |
 | `ai_clip_asr_compute_type` | str | `int8_float16` | ASR 精度。`int8_float16`(省显存,~3GB) / `float16`(~4.5GB) / `int8`。8GB 显存用默认。 |
 | `ai_clip_use_4bit` | bool | `true` | VLM 4-bit 量化。**8GB 显存必开**（不开 BF16 权重 ~9.5GB 会 OOM）。12GB+ 可关。 |
@@ -21,6 +25,22 @@
 | `ai_clip_min_clip_seconds` | str→float | `5` | 最短片段（秒）。**模型原始输出** < 此值则丢弃（碎片/抖动过滤）。在 padding 之前施加。 |
 | `ai_clip_max_retries` | str→int | `3` | 单片 ffmpeg 切失败的重试次数，超过则跳过并发失败通知。 |
 | `ai_clip_custom_content` | str | 见下 | 切片通知文案模板，支持占位符。 |
+
+## LLM 云端模式（openai_chat）
+
+`ai_clip_llm_provider=openai_chat` 时，LLM 整段文本理解不再本地加载 Qwen2.5，而是把**同一套提示词 + 完整字幕**发到 OpenAI-chat 兼容的云端接口（SiliconFlow / DeepSeek / OpenAI / 本地 vLLM、ollama 等均可）：
+
+```
+POST {ai_clip_llm_api_base}/chat/completions
+Authorization: Bearer {ai_clip_llm_api_key}
+{"model": "...", "messages": [system, user], "temperature": 0, "max_tokens": ...}
+```
+
+- **只需设 3 项**：`api_base`（填到 `/v1`）、`api_key`、`api_model`；提示词与 `ai_clip_llm_max_new_tokens` 与本地模式共用。
+- **ASR 仍是本地**（faster-whisper/SenseVoice），只换 LLM 推理。
+- 云端模式下不加载本地 LLM、不占显存，也**不需要** torch/transformers/bitsandbytes 的 LLM 部分（httpx 是主依赖自带）。
+- 请求失败按 `ai_clip_max_retries` 指数退避重试（1s/2s/4s），全部失败该段返回空（走既有失败日志路径，不中断流水线）。
+- API Key 只存本地 `config/default_settings.json`，日志里不打印。
 
 ## 通知文案模板占位符
 

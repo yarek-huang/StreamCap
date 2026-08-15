@@ -593,6 +593,52 @@ class SettingsPage(PageBase):
                             ),
                         ),
                         self.create_setting_row(
+                            self._["ai_clip_llm_provider"],
+                            ft.Dropdown(
+                                options=[
+                                    ft.dropdown.DropdownOption(key="local", text=self._["ai_clip_llm_provider_local"]),
+                                    ft.dropdown.DropdownOption(key="openai_chat", text=self._["ai_clip_llm_provider_openai_chat"]),
+                                ],
+                                value=self.get_config_value("ai_clip_llm_provider", "local"),
+                                width=300,
+                                on_select=self.on_change,
+                                data="ai_clip_llm_provider",
+                                tooltip=self._["ai_clip_llm_provider_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
+                            self._["ai_clip_llm_api_base"],
+                            ft.TextField(
+                                value=self.get_config_value("ai_clip_llm_api_base"),
+                                width=300,
+                                data="ai_clip_llm_api_base",
+                                on_change=self.on_change,
+                                hint_text=self._["ai_clip_llm_api_base_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
+                            self._["ai_clip_llm_api_key"],
+                            ft.TextField(
+                                value=self.get_config_value("ai_clip_llm_api_key"),
+                                width=300,
+                                password=True,
+                                can_reveal_password=True,
+                                data="ai_clip_llm_api_key",
+                                on_change=self.on_change,
+                                hint_text=self._["ai_clip_llm_api_key_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
+                            self._["ai_clip_llm_api_model"],
+                            ft.TextField(
+                                value=self.get_config_value("ai_clip_llm_api_model"),
+                                width=300,
+                                data="ai_clip_llm_api_model",
+                                on_change=self.on_change,
+                                hint_text=self._["ai_clip_llm_api_model_tip"],
+                            ),
+                        ),
+                        self.create_setting_row(
                             self._["ai_clip_asr_model_path"],
                             ft.TextField(
                                 value=self.get_config_value("ai_clip_asr_model_path"),

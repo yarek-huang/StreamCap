@@ -39,7 +39,9 @@ def _load_sensevoice(model_path: str):
     from funasr import AutoModel  # type: ignore
     logger.info(f"[AI-Clip] Loading SenseVoice (funasr, cached): {model_path}")
     # SenseVoice runs on GPU via funasr's own device handling. disable_update=True
-    # to avoid network checks; disable_pbar for clean logs.
+    # to avoid network checks; disable_pbar for clean logs. No vad_model here:
+    # VAD runs as its own cached model below (see _get_vad_model) so segments
+    # carry utterance timestamps SenseVoice alone cannot produce.
     return AutoModel(
         model=model_path,
         trust_remote_code=True,
@@ -47,6 +49,70 @@ def _load_sensevoice(model_path: str):
         disable_pbar=True,
         device="cuda:0",
     )
+
+
+# Separate cached fsmn-vad model for SenseVoice utterance segmentation.
+# Tiny (~2MB weights, auto-downloads from ModelScope/HF on first use).
+_VAD_MODEL: Any = None
+
+
+def _get_vad_model():
+    """Return the cached fsmn-vad AutoModel for utterance-boundary detection."""
+    global _VAD_MODEL
+    if _VAD_MODEL is None:
+        from funasr import AutoModel  # type: ignore
+        logger.info("[AI-Clip] Loading fsmn-vad (cached, auto-downloads on first use)")
+        _VAD_MODEL = AutoModel(
+            model="fsmn-vad",
+            disable_update=True,
+            disable_pbar=True,
+            device="cuda:0",
+        )
+    return _VAD_MODEL
+
+
+def _extract_wav_16k(video_path: str) -> str:
+    """Extract 16kHz mono wav to a temp file via ffmpeg. Caller must remove it."""
+    import subprocess
+    import tempfile
+    fd, wav_path = tempfile.mkstemp(suffix=".wav", prefix="aiclip_asr_")
+    os.close(fd)
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn", "-ar", "16000", "-ac", "1", "-f", "wav", wav_path,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True)
+    except Exception:
+        # ffmpeg binary missing etc. — remove the temp file we just created.
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+        raise
+    if proc.returncode != 0 or not os.path.exists(wav_path) or os.path.getsize(wav_path) == 0:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
+        raise RuntimeError(f"ffmpeg wav extraction failed: {proc.stderr[-500:]!r}")
+    return wav_path
+
+
+def _merge_vad_segments(segs_ms: list, max_ms: int = 15000) -> list[list[int]]:
+    """Merge adjacent VAD utterances up to ~max_ms per chunk.
+
+    Utterance gaps are silence; letting a chunk span them keeps timestamps
+    aligned (the chunk's [start, end] covers its speech) while avoiding one
+    SenseVoice call per 2-3s utterance.
+    """
+    merged: list[list[int]] = []
+    for s, e in segs_ms:
+        if merged and (e - merged[-1][0]) <= max_ms:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return merged
 
 
 def _load_whisper(model_path: str, compute_type: str):
@@ -72,12 +138,14 @@ def _get_asr_model(model_path: str, compute_type: str):
 
 
 def release_asr_models() -> None:
-    """Unload all cached ASR models and free VRAM. Call after the run ends."""
+    """Unload all cached ASR models (incl. fsmn-vad) and free VRAM. Call after the run ends."""
+    global _VAD_MODEL
     with _ASR_LOCK:
         if not _ASR_CACHE:
             return
         n = len(_ASR_CACHE)
         _ASR_CACHE.clear()
+        _VAD_MODEL = None
     logger.info(f"[AI-Clip] released {n} cached ASR model(s)")
     try:
         import torch
@@ -132,37 +200,53 @@ def _transcribe_sensevoice(model, video_path: str, language: str | None) -> list
     """SenseVoice transcription via funasr -> [{start, end, text}].
 
     SenseVoice itself outputs full text with rich tags (emotion/events) but not
-    per-sentence timestamps. We run VAD-based segmentation first (fsmn-vad) to
-    get clip-level timestamps, then transcribe each chunk and map back. The
-    timestamps come from the VAD model (utterance boundaries), which is reliable.
+    per-sentence timestamps, so timestamps come from fsmn-vad utterance
+    boundaries: extract 16k wav -> VAD -> merge utterances into <=15s chunks ->
+    transcribe each chunk -> map text onto the chunk's [start, end].
     """
-    # First get VAD timestamps (utterance boundaries).
-    res = model.generate(
-        input=video_path,
-        cache={},
-        language="auto" if not language else language,
-        use_itn=True,
-        merge_length=15000,  # merge very short VAD segments
-    )
-    results: list[dict] = []
-    for item in res:
-        text = (item.get("text") or "").strip()
-        if not text:
-            continue
-        # SenseVoice text carries tags like <|HAPPY|><|Speech|>; strip them for
-        # cleaner downstream matching, keep plain text for the transcript.
-        clean = _strip_sv_tags(text)
-        if not clean:
-            continue
-        # funasr may provide sentence_info or timestamp fields depending on config.
-        # Fall back to whole-file span when no per-utterance timestamp is present.
-        s = float(item.get("start", 0.0) or 0.0) / 1000.0  # ms -> s
-        e = float(item.get("end", 0.0) or 0.0) / 1000.0
-        if e <= s:
-            # No reliable timestamp from this item; treat as 0-length (filtered later).
-            e = s
-        results.append({"start": s, "end": e, "text": clean})
-    return results
+    wav_path = _extract_wav_16k(video_path)
+    try:
+        vad_res = _get_vad_model().generate(input=wav_path)
+        segs_ms: list = (vad_res[0] or {}).get("value") or []
+        if not segs_ms:
+            logger.warning("[AI-Clip] fsmn-vad found no speech segments.")
+            return []
+        chunks = _merge_vad_segments(segs_ms, max_ms=15000)
+
+        import soundfile as sf  # funasr/torchaudio dep, in requirements-ai-clip.txt
+        audio, sr = sf.read(wav_path, dtype="float32")
+        if audio.ndim > 1:
+            audio = audio[:, 0]
+
+        results: list[dict] = []
+        lang = "auto" if not language else language
+        for i, (s_ms, e_ms) in enumerate(chunks, 1):
+            seg_audio = audio[int(s_ms / 1000 * sr):int(e_ms / 1000 * sr)]
+            if seg_audio.size < int(sr * 0.2):  # skip <200ms slivers
+                continue
+            res = model.generate(
+                input=seg_audio,
+                cache={},
+                language=lang,
+                use_itn=True,
+                disable_pbar=True,
+            )
+            for item in res:
+                text = _strip_sv_tags((item.get("text") or "").strip())
+                if text:
+                    results.append({
+                        "start": round(s_ms / 1000, 2),
+                        "end": round(e_ms / 1000, 2),
+                        "text": text,
+                    })
+            if i % 20 == 0:
+                logger.info(f"[AI-Clip] SenseVoice chunk {i}/{len(chunks)} ...")
+        return results
+    finally:
+        try:
+            os.remove(wav_path)
+        except OSError:
+            pass
 
 
 _SV_TAG_RE = re.compile(r"<\|[^|]*\|>")
